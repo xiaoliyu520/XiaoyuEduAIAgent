@@ -78,10 +78,19 @@ async def search(
     query: str,
     top_k: int = 20,
     filter_expr: Optional[str] = None,
+    exclude_archived: bool = True,
 ) -> list[dict]:
     ensure_collection(collection_name)
     client = get_milvus_client()
     query_vector = await embed_query(query)
+
+    if exclude_archived:
+        archive_filter = 'metadata["doc_status"] != "archived"'
+        if filter_expr:
+            filter_expr = f"({filter_expr}) and ({archive_filter})"
+        else:
+            filter_expr = archive_filter
+
     results = client.search(
         collection_name=collection_name,
         data=[query_vector],
@@ -107,10 +116,15 @@ async def hybrid_search(
     top_k: int = 20,
     bm25_results: Optional[list[dict]] = None,
     alpha: float = 0.7,
+    exclude_archived: bool = True,
 ) -> list[dict]:
-    vector_results = await search(collection_name, query, top_k=top_k)
+    vector_results = await search(collection_name, query, top_k=top_k, exclude_archived=exclude_archived)
     if bm25_results is None:
         return vector_results
+
+    if exclude_archived:
+        bm25_results = [doc for doc in bm25_results if doc.get("metadata", {}).get("doc_status") != "archived"]
+
     combined = {}
     for doc in vector_results:
         key = doc["chunk_id"]
@@ -162,6 +176,11 @@ async def delete_documents_by_metadata(
     if not client.has_collection(collection_name):
         return
 
+    try:
+        client.load_collection(collection_name)
+    except Exception:
+        return
+
     filter_parts = []
     for key, value in metadata_filter.items():
         if isinstance(value, str):
@@ -176,4 +195,49 @@ async def delete_documents_by_metadata(
         client.delete(
             collection_name=collection_name,
             filter=filter_expr,
+        )
+
+
+async def update_document_status(
+    collection_name: str,
+    doc_title: str,
+    new_status: str,
+):
+    client = get_milvus_client()
+    if not client.has_collection(collection_name):
+        return
+
+    try:
+        client.load_collection(collection_name)
+    except Exception:
+        return
+
+    filter_expr = f'metadata["source"] == "{doc_title}"'
+
+    results = client.query(
+        collection_name=collection_name,
+        filter=filter_expr,
+        output_fields=["chunk_id", "content", "metadata", "vector"],
+    )
+
+    if not results:
+        return
+
+    await delete_documents_by_metadata(collection_name, {"source": doc_title})
+
+    insert_data = []
+    for item in results:
+        metadata = item.get("metadata", {})
+        metadata["doc_status"] = new_status
+        insert_data.append({
+            "chunk_id": item["chunk_id"],
+            "content": item["content"],
+            "metadata": metadata,
+            "vector": item["vector"],
+        })
+
+    if insert_data:
+        client.insert(
+            collection_name=collection_name,
+            data=insert_data,
         )

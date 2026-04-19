@@ -16,10 +16,10 @@ from app.models.schemas import (
 from app.api.deps import get_current_user, require_admin
 from app.mcp.milvus.client import (
     insert_documents, delete_collection, get_collection_stats, ensure_collection,
-    delete_documents_by_metadata, search,
+    delete_documents_by_metadata, search, update_document_status,
 )
 from app.mcp.milvus.bm25 import get_bm25_index
-from app.core.minio import upload_file, get_file
+from app.core.minio import upload_file
 
 router = APIRouter(prefix="/knowledge", tags=["知识库"])
 
@@ -126,11 +126,11 @@ async def upload_document(
         await insert_documents(
             collection_name=kb.collection_name,
             contents=chunks,
-            metadatas=[{"source": file.filename, "chunk_index": i, "doc_title": file.filename} for i in range(len(chunks))],
+            metadatas=[{"source": file.filename, "chunk_index": i, "doc_title": file.filename, "doc_status": "active"} for i in range(len(chunks))],
         )
 
         bm25 = get_bm25_index()
-        bm25_docs = [{"content": c, "chunk_id": f"{file.filename}_chunk_{i}"} for i, c in enumerate(chunks)]
+        bm25_docs = [{"content": c, "chunk_id": f"{file.filename}_chunk_{i}", "metadata": {"doc_status": "active"}} for i, c in enumerate(chunks)]
         bm25.build_index(kb.collection_name, bm25_docs)
 
     doc = KnowledgeDocument(
@@ -190,14 +190,15 @@ async def _update_document(
     await delete_documents_by_metadata(kb.collection_name, {"source": file_name})
 
     if new_chunks:
+        doc_status = existing_doc.status if existing_doc.status else "active"
         await insert_documents(
             collection_name=kb.collection_name,
             contents=new_chunks,
-            metadatas=[{"source": file_name, "chunk_index": i, "doc_title": file_name} for i in range(len(new_chunks))],
+            metadatas=[{"source": file_name, "chunk_index": i, "doc_title": file_name, "doc_status": doc_status} for i in range(len(new_chunks))],
         )
 
         bm25 = get_bm25_index()
-        bm25_docs = [{"content": c, "chunk_id": f"{file_name}_chunk_{i}"} for i, c in enumerate(new_chunks)]
+        bm25_docs = [{"content": c, "chunk_id": f"{file_name}_chunk_{i}", "metadata": {"doc_status": doc_status}} for i, c in enumerate(new_chunks)]
         bm25.build_index(kb.collection_name, bm25_docs)
 
     chunk_diff = len(new_chunks) - old_chunk_count
@@ -348,7 +349,7 @@ async def delete_document(
 
 
 @router.put("/documents/{doc_id}/status", response_model=ResponseBase)
-async def update_document_status(
+async def update_document_status_api(
     doc_id: int,
     status: str = Query(..., description="文档状态: active/archived"),
     current_user: User = Depends(require_admin),
@@ -359,8 +360,14 @@ async def update_document_status(
     if not doc:
         raise ValueError("文档不存在")
 
+    old_status = doc.status
     doc.status = status
     await db.commit()
+
+    kb_result = await db.execute(select(KnowledgeBase).where(KnowledgeBase.id == doc.kb_id))
+    kb = kb_result.scalar_one_or_none()
+    if kb:
+        await update_document_status(kb.collection_name, doc.title, status)
 
     return ResponseBase(data=DocumentResponse.model_validate(doc).model_dump())
 

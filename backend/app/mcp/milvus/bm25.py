@@ -24,6 +24,7 @@ class BM25Index:
         collection_name: str,
         query: str,
         top_k: int = 20,
+        exclude_archived: bool = True,
     ) -> list[dict]:
         if collection_name not in self._indices:
             return []
@@ -33,12 +34,16 @@ class BM25Index:
         scored_docs = list(zip(index.documents, scores))
         scored_docs.sort(key=lambda x: x[1], reverse=True)
         results = []
-        for doc, score in scored_docs[:top_k]:
+        for doc, score in scored_docs:
             if score > 0:
+                if exclude_archived and doc.get("metadata", {}).get("doc_status") == "archived":
+                    continue
                 results.append({
                     **doc,
                     "score": float(score),
                 })
+            if len(results) >= top_k:
+                break
         return results
 
     def has_index(self, collection_name: str) -> bool:
