@@ -1,40 +1,89 @@
 <template>
-  <div class="chat-container">
-    <div class="chat-messages" ref="messagesRef">
-      <div
-        v-for="(msg, index) in messages"
-        :key="index"
-        :class="['message-item', msg.role === 'user' ? 'message-user' : 'message-assistant']"
-      >
-        <div class="message-avatar">
-          {{ msg.role === 'user' ? '👤' : '🤖' }}
-        </div>
-        <div class="message-content">
-          <div class="message-text" v-html="renderMarkdown(msg.content)"></div>
-        </div>
+  <div class="chat-page">
+    <div class="sidebar">
+      <div class="sidebar-header">
+        <el-button type="primary" @click="newConversation" style="width: 100%">
+          <el-icon><Plus /></el-icon>
+          新建对话
+        </el-button>
       </div>
-      <div v-if="streaming" class="message-item message-assistant">
-        <div class="message-avatar">🤖</div>
-        <div class="message-content">
-          <div class="message-text" v-html="renderMarkdown(streamContent)"></div>
-          <span class="typing-indicator">▊</span>
+      <div class="conversation-list">
+        <div
+          v-for="conv in conversations"
+          :key="conv.id"
+          :class="['conversation-item', { active: conversationId === conv.id }]"
+          @click="selectConversation(conv)"
+        >
+          <div class="conv-title">{{ conv.title }}</div>
+          <div class="conv-time">{{ formatTime(conv.created_at) }}</div>
+          <el-button
+            class="delete-btn"
+            type="danger"
+            size="small"
+            text
+            @click.stop="deleteConversation(conv.id)"
+          >
+            <el-icon><Delete /></el-icon>
+          </el-button>
         </div>
       </div>
     </div>
-    <div class="chat-input">
-      <el-input
-        v-model="inputText"
-        placeholder="输入你的问题..."
-        @keydown.enter="sendMessage"
-        :disabled="streaming"
-        size="large"
-      >
-        <template #append>
-          <el-button @click="sendMessage" :loading="streaming" type="primary">
-            发送
-          </el-button>
-        </template>
-      </el-input>
+    <div class="chat-container">
+      <div class="chat-header">
+        <el-select
+          v-model="selectedKbIds"
+          placeholder="选择知识库(可多选)"
+          multiple
+          clearable
+          collapse-tags
+          collapse-tags-tooltip
+          style="width: 280px"
+        >
+          <el-option
+            v-for="kb in knowledgeBases"
+            :key="kb.id"
+            :label="kb.name"
+            :value="kb.id"
+          />
+        </el-select>
+        <span class="kb-hint">{{ selectedKbIds.length > 0 ? `已选 ${selectedKbIds.length} 个知识库` : '⚠️ 请选择知识库后开始对话' }}</span>
+      </div>
+      <div class="chat-messages" ref="messagesRef">
+        <div
+          v-for="(msg, index) in messages"
+          :key="index"
+          :class="['message-item', msg.role === 'user' ? 'message-user' : 'message-assistant']"
+        >
+          <div class="message-avatar">
+            {{ msg.role === 'user' ? '👤' : '🤖' }}
+          </div>
+          <div class="message-content">
+            <div class="message-text" v-html="renderMarkdown(msg.content)"></div>
+          </div>
+        </div>
+        <div v-if="streaming" class="message-item message-assistant">
+          <div class="message-avatar">🤖</div>
+          <div class="message-content">
+            <div class="message-text" v-html="renderMarkdown(streamContent)"></div>
+            <span class="typing-indicator">▊</span>
+          </div>
+        </div>
+      </div>
+      <div class="chat-input">
+        <el-input
+          v-model="inputText"
+          placeholder="输入你的问题..."
+          @keydown.enter="sendMessage"
+          :disabled="streaming"
+          size="large"
+        >
+          <template #append>
+            <el-button @click="sendMessage" :loading="streaming" type="primary">
+              发送
+            </el-button>
+          </template>
+        </el-input>
+      </div>
     </div>
   </div>
 </template>
@@ -46,6 +95,8 @@ import { chatStream } from '../utils/sse'
 import { marked } from 'marked'
 import hljs from 'highlight.js'
 import 'highlight.js/styles/github.css'
+import { Plus, Delete } from '@element-plus/icons-vue'
+import { ElMessage } from 'element-plus'
 
 marked.setOptions({
   highlight(code, lang) {
@@ -62,6 +113,9 @@ const streaming = ref(false)
 const streamContent = ref('')
 const messagesRef = ref(null)
 const conversationId = ref(null)
+const knowledgeBases = ref([])
+const selectedKbIds = ref([])
+const conversations = ref([])
 
 function renderMarkdown(text) {
   if (!text) return ''
@@ -76,9 +130,63 @@ function scrollToBottom() {
   })
 }
 
+function formatTime(time) {
+  if (!time) return ''
+  const date = new Date(time)
+  return date.toLocaleDateString('zh-CN', { month: 'short', day: 'numeric' })
+}
+
+async function loadConversations() {
+  try {
+    const res = await api.get('/chat/conversations')
+    conversations.value = res.data || []
+  } catch {
+    // ignore
+  }
+}
+
+async function newConversation() {
+  try {
+    const res = await api.post('/chat/conversations')
+    conversations.value.unshift(res.data)
+    conversationId.value = res.data.id
+    messages.value = []
+  } catch {
+    // ignore
+  }
+}
+
+function selectConversation(conv) {
+  conversationId.value = conv.id
+  messages.value = conv.messages || []
+  scrollToBottom()
+}
+
+async function deleteConversation(id) {
+  try {
+    await api.delete(`/chat/conversations/${id}`)
+    conversations.value = conversations.value.filter(c => c.id !== id)
+    if (conversationId.value === id) {
+      if (conversations.value.length > 0) {
+        selectConversation(conversations.value[0])
+      } else {
+        conversationId.value = null
+        messages.value = []
+      }
+    }
+  } catch {
+    // ignore
+  }
+}
+
 async function sendMessage() {
   const text = inputText.value.trim()
   if (!text || streaming.value) return
+
+  if (selectedKbIds.value.length === 0) {
+    ElMessage.warning('请先选择至少一个知识库')
+    return
+  }
 
   messages.value.push({ role: 'user', content: text })
   inputText.value = ''
@@ -86,13 +194,19 @@ async function sendMessage() {
   streamContent.value = ''
   scrollToBottom()
 
+  const requestData = {
+    message: text,
+    conversation_id: conversationId.value,
+    agent_type: 'qa',
+  }
+
+  if (selectedKbIds.value.length > 0) {
+    requestData.kb_ids = selectedKbIds.value
+  }
+
   await chatStream(
     '/chat/stream',
-    {
-      message: text,
-      conversation_id: conversationId.value,
-      agent_type: 'qa',
-    },
+    requestData,
     (chunk) => {
       streamContent.value += chunk
       scrollToBottom()
@@ -105,6 +219,7 @@ async function sendMessage() {
       streaming.value = false
       streamContent.value = ''
       scrollToBottom()
+      loadConversations()
     },
     (error) => {
       messages.value.push({ role: 'assistant', content: `❌ 出错了: ${error}` })
@@ -114,34 +229,97 @@ async function sendMessage() {
   )
 }
 
-onMounted(() => {
-  loadConversations()
-})
-
-async function loadConversations() {
+async function loadKnowledgeBases() {
   try {
-    const res = await api.get('/chat/conversations')
-    const data = res.data || []
-    if (data.length > 0) {
-      conversationId.value = data[0].id
-      messages.value = data[0].messages || []
-    }
+    const res = await api.get('/knowledge/bases')
+    knowledgeBases.value = res.data || []
   } catch {
     // ignore
   }
 }
+
+onMounted(() => {
+  loadKnowledgeBases()
+  loadConversations()
+})
 </script>
 
 <style scoped>
-.chat-container {
+.chat-page {
+  display: flex;
+  height: 100%;
+  background: #f5f7fa;
+}
+.sidebar {
+  width: 260px;
+  background: #fff;
+  border-right: 1px solid #e4e7ed;
   display: flex;
   flex-direction: column;
-  height: 100%;
+}
+.sidebar-header {
+  padding: 16px;
+  border-bottom: 1px solid #e4e7ed;
+}
+.conversation-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px;
+}
+.conversation-item {
+  padding: 12px;
+  border-radius: 8px;
+  cursor: pointer;
+  margin-bottom: 4px;
+  position: relative;
+}
+.conversation-item:hover {
+  background: #f0f2f5;
+}
+.conversation-item.active {
+  background: #ecf5ff;
+}
+.conv-title {
+  font-size: 14px;
+  color: #303133;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding-right: 24px;
+}
+.conv-time {
+  font-size: 12px;
+  color: #909399;
+  margin-top: 4px;
+}
+.delete-btn {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  opacity: 0;
+}
+.conversation-item:hover .delete-btn {
+  opacity: 1;
+}
+.chat-container {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
   max-width: 900px;
   margin: 0 auto;
   background: #fff;
-  border-radius: 12px;
-  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.06);
+}
+.chat-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 20px;
+  border-bottom: 1px solid #e4e7ed;
+}
+.kb-hint {
+  color: #909399;
+  font-size: 12px;
 }
 .chat-messages {
   flex: 1;

@@ -5,12 +5,13 @@ import json
 import hashlib
 from datetime import datetime
 from typing import Optional
+import io
 
 from app.core.database import get_db
 from app.models.database import User, KnowledgeBase, KnowledgeDocument, KnowledgeGap, DocumentVersion
 from app.models.schemas import (
     KnowledgeBaseCreate, KnowledgeBaseResponse, KnowledgeGapResponse,
-    KnowledgeGapResolve, ResponseBase, DocumentResponse, DocumentVersionResponse,
+    KnowledgeGapResolve, KnowledgeGapIgnore, ResponseBase, DocumentResponse, DocumentVersionResponse,
     PageResponse,
 )
 from app.api.deps import get_current_user, require_admin
@@ -22,6 +23,31 @@ from app.mcp.milvus.bm25 import get_bm25_index
 from app.core.minio import upload_file
 
 router = APIRouter(prefix="/knowledge", tags=["知识库"])
+
+
+def extract_text_from_file(file_data: bytes, file_type: str) -> str:
+    if file_type == "pdf":
+        try:
+            from PyPDF2 import PdfReader
+            reader = PdfReader(io.BytesIO(file_data))
+            text_parts = []
+            for page in reader.pages:
+                text = page.extract_text()
+                if text and text.strip():
+                    text_parts.append(text.strip())
+            return "\n\n".join(text_parts)
+        except Exception as e:
+            return ""
+    elif file_type == "docx":
+        try:
+            from docx import Document
+            doc = Document(io.BytesIO(file_data))
+            text_parts = [p.text for p in doc.paragraphs if p.text.strip()]
+            return "\n\n".join(text_parts)
+        except Exception as e:
+            return ""
+    else:
+        return file_data.decode("utf-8", errors="ignore")
 
 
 @router.post("/bases", response_model=ResponseBase)
@@ -119,19 +145,26 @@ async def upload_document(
     object_name = f"knowledge/{kb.collection_name}/{file.filename}"
     await upload_file(object_name, file_data, file.content_type or "application/octet-stream")
 
-    content = file_data.decode("utf-8", errors="ignore")
+    file_ext = file.filename.split(".")[-1].lower() if "." in file.filename else "txt"
+    content = extract_text_from_file(file_data, file_ext)
+    
+    if not content.strip():
+        return ResponseBase(message="文档内容为空或无法解析", data={"empty": True})
+    
     chunks = _split_text(content, chunk_size=500, overlap=50)
 
     if chunks:
+        chunk_ids = [f"{file.filename}_chunk_{i}" for i in range(len(chunks))]
         await insert_documents(
             collection_name=kb.collection_name,
             contents=chunks,
             metadatas=[{"source": file.filename, "chunk_index": i, "doc_title": file.filename, "doc_status": "active"} for i in range(len(chunks))],
+            chunk_ids=chunk_ids,
         )
 
         bm25 = get_bm25_index()
-        bm25_docs = [{"content": c, "chunk_id": f"{file.filename}_chunk_{i}", "metadata": {"doc_status": "active"}} for i, c in enumerate(chunks)]
-        bm25.build_index(kb.collection_name, bm25_docs)
+        bm25_docs = [{"content": c, "chunk_id": chunk_ids[i], "metadata": {"source": file.filename, "chunk_index": i, "doc_title": file.filename, "doc_status": "active"}} for i, c in enumerate(chunks)]
+        await bm25.add_documents(kb.collection_name, bm25_docs)
 
     doc = KnowledgeDocument(
         kb_id=kb_id,
@@ -184,22 +217,31 @@ async def _update_document(
     object_name = f"knowledge/{kb.collection_name}/{file_name}_v{existing_doc.version + 1}"
     await upload_file(object_name, file_data, content_type)
 
-    content = file_data.decode("utf-8", errors="ignore")
+    file_ext = file_name.split(".")[-1].lower() if "." in file_name else "txt"
+    content = extract_text_from_file(file_data, file_ext)
+    
+    if not content.strip():
+        return ResponseBase(message="文档内容为空或无法解析", data={"empty": True})
+    
     new_chunks = _split_text(content, chunk_size=500, overlap=50)
 
     await delete_documents_by_metadata(kb.collection_name, {"source": file_name})
 
+    bm25 = get_bm25_index()
+    await bm25.remove_document(kb.collection_name, file_name)
+
     if new_chunks:
         doc_status = existing_doc.status if existing_doc.status else "active"
+        chunk_ids = [f"{file_name}_chunk_{i}" for i in range(len(new_chunks))]
         await insert_documents(
             collection_name=kb.collection_name,
             contents=new_chunks,
             metadatas=[{"source": file_name, "chunk_index": i, "doc_title": file_name, "doc_status": doc_status} for i in range(len(new_chunks))],
+            chunk_ids=chunk_ids,
         )
 
-        bm25 = get_bm25_index()
-        bm25_docs = [{"content": c, "chunk_id": f"{file_name}_chunk_{i}", "metadata": {"doc_status": doc_status}} for i, c in enumerate(new_chunks)]
-        bm25.build_index(kb.collection_name, bm25_docs)
+        bm25_docs = [{"content": c, "chunk_id": chunk_ids[i], "metadata": {"source": file_name, "chunk_index": i, "doc_title": file_name, "doc_status": doc_status}} for i, c in enumerate(new_chunks)]
+        await bm25.add_documents(kb.collection_name, bm25_docs)
 
     chunk_diff = len(new_chunks) - old_chunk_count
     if chunk_diff > 0:
@@ -332,6 +374,8 @@ async def delete_document(
 
     if kb:
         await delete_documents_by_metadata(kb.collection_name, {"source": doc.title})
+        bm25 = get_bm25_index()
+        await bm25.remove_document(kb.collection_name, doc.title)
         kb.doc_count -= doc.chunk_count
         if kb.doc_count < 0:
             kb.doc_count = 0
@@ -360,7 +404,6 @@ async def update_document_status_api(
     if not doc:
         raise ValueError("文档不存在")
 
-    old_status = doc.status
     doc.status = status
     await db.commit()
 
@@ -368,6 +411,8 @@ async def update_document_status_api(
     kb = kb_result.scalar_one_or_none()
     if kb:
         await update_document_status(kb.collection_name, doc.title, status)
+        bm25 = get_bm25_index()
+        await bm25.update_document_status(kb.collection_name, doc.title, status)
 
     return ResponseBase(data=DocumentResponse.model_validate(doc).model_dump())
 
@@ -375,14 +420,30 @@ async def update_document_status_api(
 @router.get("/gaps", response_model=ResponseBase)
 async def list_knowledge_gaps(
     status: str = "open",
+    kb_id: Optional[int] = None,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(
-        select(KnowledgeGap).where(KnowledgeGap.status == status)
-    )
+    query = select(KnowledgeGap).where(KnowledgeGap.status == status)
+    if kb_id:
+        query = query.where(KnowledgeGap.kb_id == kb_id)
+    query = query.order_by(KnowledgeGap.created_at.desc())
+    result = await db.execute(query)
     gaps = result.scalars().all()
-    items = [KnowledgeGapResponse.model_validate(g).model_dump() for g in gaps]
+    
+    kb_map = {}
+    kb_ids = set(g.kb_id for g in gaps if g.kb_id)
+    if kb_ids:
+        kb_result = await db.execute(select(KnowledgeBase).where(KnowledgeBase.id.in_(kb_ids)))
+        for kb in kb_result.scalars().all():
+            kb_map[kb.id] = kb.name
+    
+    items = []
+    for g in gaps:
+        item = KnowledgeGapResponse.model_validate(g).model_dump()
+        item["kb_name"] = kb_map.get(g.kb_id)
+        items.append(item)
+    
     return ResponseBase(data=items)
 
 
@@ -393,13 +454,200 @@ async def resolve_knowledge_gap(
     current_user: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
+    import logging
+    logger = logging.getLogger(__name__)
+    
     result = await db.execute(select(KnowledgeGap).where(KnowledgeGap.id == gap_id))
     gap = result.scalar_one_or_none()
     if not gap:
         raise ValueError("知识缺口不存在")
+    
+    if not gap.kb_id:
+        gap.answer = data.answer
+        gap.status = "resolved"
+        gap.resolved_at = datetime.now()
+        await db.commit()
+        logger.warning(f"知识缺口 {gap_id} 未关联知识库，仅更新状态")
+        return ResponseBase(
+            message="知识缺口未关联知识库，答案已保存但未补录到知识库",
+            data=KnowledgeGapResponse.model_validate(gap).model_dump()
+        )
+    
+    kb_result = await db.execute(select(KnowledgeBase).where(KnowledgeBase.id == gap.kb_id))
+    kb = kb_result.scalar_one_or_none()
+    if not kb:
+        raise ValueError("关联的知识库不存在")
+    
+    doc_title = "知识补录"
+    new_entry = f"\n\n---\n\n## 问题：{gap.question}\n\n**答案：**{data.answer}"
+    
+    existing_doc_result = await db.execute(
+        select(KnowledgeDocument).where(
+            KnowledgeDocument.kb_id == gap.kb_id,
+            KnowledgeDocument.title == doc_title
+        )
+    )
+    existing_doc = existing_doc_result.scalar_one_or_none()
+    
+    bm25 = get_bm25_index()
+    
+    if existing_doc:
+        logger.info(f"追加到现有补录文档 '{doc_title}'")
+        
+        await delete_documents_by_metadata(
+            kb.collection_name,
+            {"doc_title": doc_title}
+        )
+        await bm25.remove_document(kb.collection_name, doc_title)
+        
+        existing_content = ""
+        old_gap_results = await db.execute(
+            select(KnowledgeGap).where(
+                KnowledgeGap.kb_id == gap.kb_id,
+                KnowledgeGap.status == "resolved",
+                KnowledgeGap.id != gap_id
+            ).order_by(KnowledgeGap.resolved_at)
+        )
+        old_gaps = old_gap_results.scalars().all()
+        for old_gap in old_gaps:
+            if old_gap.answer and not old_gap.answer.startswith("[忽略原因]"):
+                existing_content += f"\n\n---\n\n## 问题：{old_gap.question}\n\n**答案：**{old_gap.answer}"
+        
+        full_content = existing_content + new_entry
+        content_hash = hashlib.sha256(full_content.encode()).hexdigest()
+        
+        chunks = _split_text(full_content, chunk_size=500, overlap=50)
+        if chunks:
+            chunk_ids = [f"{doc_title}_chunk_{i}" for i in range(len(chunks))]
+            await insert_documents(
+                collection_name=kb.collection_name,
+                contents=chunks,
+                metadatas=[{
+                    "source": doc_title,
+                    "chunk_index": i,
+                    "doc_title": doc_title,
+                    "doc_status": "active",
+                } for i in range(len(chunks))],
+                chunk_ids=chunk_ids,
+            )
+            
+            bm25_docs = [{
+                "content": c,
+                "chunk_id": chunk_ids[i],
+                "metadata": {
+                    "source": doc_title,
+                    "chunk_index": i,
+                    "doc_title": doc_title,
+                    "doc_status": "active"
+                }
+            } for i, c in enumerate(chunks)]
+            await bm25.add_documents(kb.collection_name, bm25_docs)
+        
+        existing_doc.content_hash = content_hash
+        existing_doc.chunk_count = len(chunks)
+        existing_doc.file_size = len(full_content.encode())
+        existing_doc.version += 1
+        existing_doc.updated_at = datetime.now()
+        
+        version_record = DocumentVersion(
+            doc_id=existing_doc.id,
+            version=existing_doc.version,
+            file_path=f"gap://collection",
+            content_hash=content_hash,
+            chunk_count=len(chunks),
+            change_type="updated",
+            change_summary=f"追加知识缺口: {gap.question[:30]}",
+        )
+        db.add(version_record)
+        
+        logger.info(f"文档 '{doc_title}' 追加成功，共 {len(chunks)} 个分块")
+    else:
+        logger.info(f"创建新补录文档 '{doc_title}'")
+        
+        full_content = f"# 知识补录{new_entry}"
+        content_hash = hashlib.sha256(full_content.encode()).hexdigest()
+        
+        chunks = _split_text(full_content, chunk_size=500, overlap=50)
+        if chunks:
+            chunk_ids = [f"{doc_title}_chunk_{i}" for i in range(len(chunks))]
+            await insert_documents(
+                collection_name=kb.collection_name,
+                contents=chunks,
+                metadatas=[{
+                    "source": doc_title,
+                    "chunk_index": i,
+                    "doc_title": doc_title,
+                    "doc_status": "active",
+                } for i in range(len(chunks))],
+                chunk_ids=chunk_ids,
+            )
+            
+            bm25_docs = [{
+                "content": c,
+                "chunk_id": chunk_ids[i],
+                "metadata": {
+                    "source": doc_title,
+                    "chunk_index": i,
+                    "doc_title": doc_title,
+                    "doc_status": "active"
+                }
+            } for i, c in enumerate(chunks)]
+            await bm25.add_documents(kb.collection_name, bm25_docs)
+        
+        doc = KnowledgeDocument(
+            kb_id=gap.kb_id,
+            title=doc_title,
+            file_path="gap://collection",
+            file_type="txt",
+            file_size=len(full_content.encode()),
+            chunk_count=len(chunks),
+            content_hash=content_hash,
+            version=1,
+        )
+        db.add(doc)
+        await db.flush()
+        
+        version_record = DocumentVersion(
+            doc_id=doc.id,
+            version=1,
+            file_path="gap://collection",
+            content_hash=content_hash,
+            chunk_count=len(chunks),
+            change_type="created",
+            change_summary=f"知识补录文档创建: {gap.question[:30]}",
+        )
+        db.add(version_record)
+        
+        kb.doc_count += len(chunks)
+        
+        logger.info(f"文档 '{doc_title}' 创建成功，共 {len(chunks)} 个分块")
+    
     gap.answer = data.answer
     gap.status = "resolved"
-    gap.resolved_at = datetime.utcnow()
+    gap.resolved_at = datetime.now()
+    await db.commit()
+    
+    return ResponseBase(
+        message=f"已补录到知识库 '{kb.name}'",
+        data=KnowledgeGapResponse.model_validate(gap).model_dump()
+    )
+
+
+@router.put("/gaps/{gap_id}/ignore", response_model=ResponseBase)
+async def ignore_knowledge_gap(
+    gap_id: int,
+    data: KnowledgeGapIgnore = None,
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(KnowledgeGap).where(KnowledgeGap.id == gap_id))
+    gap = result.scalar_one_or_none()
+    if not gap:
+        raise ValueError("知识缺口不存在")
+    gap.status = "ignored"
+    if data and data.reason:
+        gap.answer = f"[忽略原因] {data.reason}"
+    gap.resolved_at = datetime.now()
     await db.commit()
     return ResponseBase(data=KnowledgeGapResponse.model_validate(gap).model_dump())
 

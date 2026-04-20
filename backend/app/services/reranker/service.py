@@ -1,19 +1,47 @@
+import os
+import numpy as np
 from typing import Optional
-from FlagEmbedding import FlagReranker
 from app.core.config import get_settings
 
 settings = get_settings()
 
-_reranker: Optional[FlagReranker] = None
+_reranker: Optional[any] = None
+_reranker_available: Optional[bool] = None
 
 
-def get_reranker() -> FlagReranker:
-    global _reranker
+def _normalize_scores(scores):
+    if isinstance(scores, (float, int, np.floating, np.integer)):
+        return [float(scores)]
+    if isinstance(scores, np.ndarray):
+        return scores.tolist()
+    if isinstance(scores, list):
+        return [float(s) for s in scores]
+    return [float(scores)]
+
+
+def get_reranker():
+    global _reranker, _reranker_available
+    
+    if not settings.ENABLE_RERANKER:
+        _reranker_available = False
+        return None
+    
+    if _reranker_available is False:
+        return None
+    
     if _reranker is None:
-        _reranker = FlagReranker(
-            settings.RERANKER_MODEL_NAME,
-            use_fp16=True,
-        )
+        try:
+            from FlagEmbedding import FlagReranker
+            _reranker = FlagReranker(
+                settings.RERANKER_MODEL_NAME,
+                use_fp16=True,
+            )
+            _reranker_available = True
+        except Exception as e:
+            print(f"重排序模型加载失败，将使用降级方案: {e}")
+            _reranker_available = False
+            return None
+    
     return _reranker
 
 
@@ -21,10 +49,13 @@ def rerank(query: str, documents: list[str], top_k: int = 3) -> list[dict]:
     reranker = get_reranker()
     if not documents:
         return []
+    
+    if reranker is None:
+        return _fallback_rerank(query, documents, top_k)
+    
     pairs = [[query, doc] for doc in documents]
     scores = reranker.compute_score(pairs, normalize=True)
-    if isinstance(scores, float):
-        scores = [scores]
+    scores = _normalize_scores(scores)
     scored_docs = list(zip(documents, scores))
     scored_docs.sort(key=lambda x: x[1], reverse=True)
     results = []
@@ -44,13 +75,63 @@ def rerank_with_metadata(
 ) -> list[dict]:
     if not documents:
         return []
-    contents = [doc[content_key] for doc in documents]
+    
     reranker = get_reranker()
+    
+    if reranker is None:
+        return _fallback_rerank_with_metadata(query, documents, content_key, top_k)
+    
+    contents = [doc[content_key] for doc in documents]
     pairs = [[query, content] for content in contents]
     scores = reranker.compute_score(pairs, normalize=True)
-    if isinstance(scores, float):
-        scores = [scores]
+    scores = _normalize_scores(scores)
     for i, score in enumerate(scores):
         documents[i]["rerank_score"] = float(score)
+    documents.sort(key=lambda x: x["rerank_score"], reverse=True)
+    return documents[:top_k]
+
+
+def _fallback_rerank(query: str, documents: list[str], top_k: int = 3) -> list[dict]:
+    from rank_bm25 import BM25Okapi
+    import jieba
+    
+    tokenized_corpus = [list(jieba.cut(doc)) for doc in documents]
+    bm25 = BM25Okapi(tokenized_corpus)
+    tokenized_query = list(jieba.cut(query))
+    scores = bm25.get_scores(tokenized_query)
+    
+    scored_docs = list(zip(documents, scores))
+    scored_docs.sort(key=lambda x: x[1], reverse=True)
+    
+    results = []
+    max_score = float(max(scores)) if len(scores) > 0 and max(scores) > 0 else 1.0
+    for doc, score in scored_docs[:top_k]:
+        normalized_score = min(float(score) / max_score, 1.0) if max_score > 0 and score > 0 else 0.0
+        results.append({
+            "content": doc,
+            "score": normalized_score,
+        })
+    return results
+
+
+def _fallback_rerank_with_metadata(
+    query: str,
+    documents: list[dict],
+    content_key: str = "content",
+    top_k: int = 3,
+) -> list[dict]:
+    from rank_bm25 import BM25Okapi
+    import jieba
+    
+    contents = [doc[content_key] for doc in documents]
+    tokenized_corpus = [list(jieba.cut(content)) for content in contents]
+    bm25 = BM25Okapi(tokenized_corpus)
+    tokenized_query = list(jieba.cut(query))
+    scores = bm25.get_scores(tokenized_query)
+    
+    max_score = float(max(scores)) if len(scores) > 0 and max(scores) > 0 else 1.0
+    for i, score in enumerate(scores):
+        documents[i]["rerank_score"] = min(float(score) / max_score, 1.0) if max_score > 0 and score > 0 else 0.0
+    
     documents.sort(key=lambda x: x["rerank_score"], reverse=True)
     return documents[:top_k]

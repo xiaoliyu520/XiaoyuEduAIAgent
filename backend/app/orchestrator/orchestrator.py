@@ -6,6 +6,9 @@ from app.agents.registry import get_agent
 from app.services.intent.classifier import classify_intent, AgentType
 from app.core.redis import get_redis, SessionCache, HotQACache
 from app.common.exceptions import AgentException
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from app.models.database import Message
 
 
 class Orchestrator:
@@ -25,6 +28,38 @@ class Orchestrator:
             self._hotqa_cache = HotQACache(redis)
         return self._hotqa_cache
 
+    async def _load_messages_from_db(self, conversation_id: int, db: AsyncSession) -> list[dict]:
+        result = await db.execute(
+            select(Message)
+            .where(Message.conversation_id == conversation_id)
+            .order_by(Message.created_at)
+        )
+        messages = result.scalars().all()
+        return [
+            {
+                "role": m.role,
+                "content": m.content,
+                "agent_type": m.agent_type,
+            }
+            for m in messages
+        ]
+
+    async def _get_conversation_messages(
+        self,
+        conversation_id: int,
+        db: AsyncSession,
+    ) -> list[dict]:
+        session_cache = await self._get_session_cache()
+        cached = await session_cache.get_messages(conversation_id)
+        
+        if cached is not None and len(cached) < 50:
+            return cached
+
+        messages = await self._load_messages_from_db(conversation_id, db)
+        if messages:
+            await session_cache.set_messages(conversation_id, messages)
+        return messages
+
     async def dispatch(
         self,
         query: str,
@@ -32,24 +67,25 @@ class Orchestrator:
         conversation_id: Optional[int] = None,
         agent_type: Optional[str] = None,
         context: Optional[dict] = None,
+        db: Optional[AsyncSession] = None,
     ) -> AgentState:
+        resolved_type = None
         if agent_type:
             try:
                 resolved_type = AgentType(agent_type)
             except ValueError:
-                resolved_type = await classify_intent(query)
-        else:
+                pass
+        
+        if resolved_type is None:
             resolved_type = await classify_intent(query)
 
         agent = get_agent(resolved_type)
         if agent is None:
             raise AgentException(f"未找到Agent: {resolved_type}")
 
-        session_cache = await self._get_session_cache()
         messages = []
-        if conversation_id:
-            cached = await session_cache.get_messages(conversation_id)
-            messages = cached
+        if conversation_id and db:
+            messages = await self._get_conversation_messages(conversation_id, db)
 
         state: AgentState = {
             "query": query,
@@ -75,22 +111,6 @@ class Orchestrator:
                 return state
 
         result = await agent.run(state)
-
-        if conversation_id:
-            await session_cache.add_message(conversation_id, {
-                "role": "user",
-                "content": query,
-            })
-            await session_cache.add_message(conversation_id, {
-                "role": "assistant",
-                "content": result.get("final_answer", ""),
-                "agent_type": resolved_type.value,
-            })
-
-        if resolved_type == AgentType.QA and result.get("confidence", 0) >= 0.8:
-            hotqa_cache = await self._get_hotqa_cache()
-            await hotqa_cache.set(query, result.get("final_answer", ""))
-
         return result
 
     async def dispatch_stream(
@@ -100,24 +120,27 @@ class Orchestrator:
         conversation_id: Optional[int] = None,
         agent_type: Optional[str] = None,
         context: Optional[dict] = None,
+        db: Optional[AsyncSession] = None,
     ) -> AsyncIterator[str]:
+        resolved_type = None
         if agent_type:
             try:
                 resolved_type = AgentType(agent_type)
             except ValueError:
-                resolved_type = await classify_intent(query)
-        else:
+                pass
+        
+        if resolved_type is None:
             resolved_type = await classify_intent(query)
 
         agent = get_agent(resolved_type)
         if agent is None:
             raise AgentException(f"未找到Agent: {resolved_type}")
 
-        session_cache = await self._get_session_cache()
         messages = []
-        if conversation_id:
-            cached = await session_cache.get_messages(conversation_id)
-            messages = cached
+        if context and context.get("history_messages"):
+            messages = context["history_messages"]
+        elif conversation_id and db:
+            messages = await self._get_conversation_messages(conversation_id, db)
 
         state: AgentState = {
             "query": query,
@@ -138,16 +161,10 @@ class Orchestrator:
             full_answer += chunk
             yield chunk
 
-        if conversation_id:
-            await session_cache.add_message(conversation_id, {
-                "role": "user",
-                "content": query,
-            })
-            await session_cache.add_message(conversation_id, {
-                "role": "assistant",
-                "content": full_answer,
-                "agent_type": resolved_type.value,
-            })
+        confidence = state.get("confidence", 0)
+        if confidence == 0:
+            confidence = state.get("context", {}).get("confidence", 0)
+        yield json.dumps({"confidence": confidence}, ensure_ascii=False)
 
 
 _orchestrator: Optional[Orchestrator] = None

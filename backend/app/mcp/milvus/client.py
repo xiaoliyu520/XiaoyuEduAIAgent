@@ -7,7 +7,7 @@ settings = get_settings()
 
 _milvus_client: Optional[MilvusClient] = None
 
-DEFAULT_DIM = 1024
+DEFAULT_DIM = 1536
 
 
 def get_milvus_client() -> MilvusClient:
@@ -82,6 +82,12 @@ async def search(
 ) -> list[dict]:
     ensure_collection(collection_name)
     client = get_milvus_client()
+
+    try:
+        client.load_collection(collection_name)
+    except Exception:
+        pass
+
     query_vector = await embed_query(query)
 
     if exclude_archived:
@@ -143,13 +149,19 @@ async def hybrid_search(
                 "vector_score": 0.0,
                 "bm25_score": doc["score"],
             }
-    for key in combined:
-        doc = combined[key]
-        max_v = max(d["vector_score"] for d in combined.values()) or 1.0
-        max_b = max(d["bm25_score"] for d in combined.values()) or 1.0
+
+    max_v = float(max((d["vector_score"] for d in combined.values()), default=0.0))
+    max_b = float(max((d["bm25_score"] for d in combined.values()), default=0.0))
+    if max_v == 0.0:
+        max_v = 1.0
+    if max_b == 0.0:
+        max_b = 1.0
+
+    for doc in combined.values():
         v_norm = doc["vector_score"] / max_v
         b_norm = doc["bm25_score"] / max_b
         doc["combined_score"] = alpha * v_norm + (1 - alpha) * b_norm
+
     sorted_results = sorted(combined.values(), key=lambda x: x["combined_score"], reverse=True)
     return sorted_results[:top_k]
 
@@ -241,3 +253,31 @@ async def update_document_status(
             collection_name=collection_name,
             data=insert_data,
         )
+
+
+def load_all_documents_from_milvus(collection_name: str) -> list[dict]:
+    client = get_milvus_client()
+    if not client.has_collection(collection_name):
+        return []
+
+    try:
+        client.load_collection(collection_name)
+    except Exception:
+        return []
+
+    results = client.query(
+        collection_name=collection_name,
+        filter="",
+        output_fields=["chunk_id", "content", "metadata"],
+        limit=10000,
+    )
+
+    documents = []
+    for item in results:
+        documents.append({
+            "chunk_id": item.get("chunk_id", ""),
+            "content": item.get("content", ""),
+            "metadata": item.get("metadata", {}),
+        })
+
+    return documents

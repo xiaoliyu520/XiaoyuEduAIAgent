@@ -12,9 +12,11 @@ class Settings(BaseSettings):
 
     DASHSCOPE_API_KEY: str = ""
     LLM_MODEL_NAME: str = "qwen-max"
-    EMBEDDING_MODEL_NAME: str = "text-embedding-v3"
+    EMBEDDING_MODEL_NAME: str = "text-embedding-v1"
     INTENT_MODEL_PATH: str = "./models/intent_classifier"
     RERANKER_MODEL_NAME: str = "BAAI/bge-reranker-v2-m3"
+    HF_MIRROR_URL: str = "https://hf-mirror.com"
+    ENABLE_RERANKER: bool = False
 
     JWT_SECRET_KEY: str = "change-me-in-production"
     JWT_ALGORITHM: str = "HS256"
@@ -23,7 +25,7 @@ class Settings(BaseSettings):
     POSTGRES_HOST: str = "localhost"
     POSTGRES_PORT: int = 5432
     POSTGRES_USER: str = "xiaoyu"
-    POSTGRES_PASSWORD: str = "xiaoyu_password"
+    POSTGRES_PASSWORD: str = "xiaoyu123"
     POSTGRES_DB: str = "xiaoyu_edu"
 
     REDIS_HOST: str = "localhost"
