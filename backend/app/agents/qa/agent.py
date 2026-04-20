@@ -1,5 +1,6 @@
 from typing import AsyncIterator
 import re
+import asyncio
 from langgraph.graph import StateGraph, END
 
 from app.agents.base import BaseAgent, AgentState
@@ -8,6 +9,7 @@ from app.services.reranker.service import rerank_with_metadata
 from app.mcp.milvus.client import search as milvus_search, hybrid_search as milvus_hybrid_search
 from app.mcp.milvus.bm25 import get_bm25_index
 from app.services.llm.factory import LLMFactory as LLM
+from app.services.intent.query_type import classify_query_type
 import json
 import logging
 
@@ -22,28 +24,6 @@ QA_SYSTEM_PROMPT = """你是一个专业的教育领域智能问答助手。你�
 3. 如果知识库中没有足够相关信息，需明确告知并标注"仅供参考"
 4. 回答要结构清晰，逻辑严密
 5. 适当引用原文，确保准确性"""
-
-
-QUERY_UNDERSTAND_PROMPT = """请分析以下用户问题的类型，并返回JSON格式结果：
-
-用户问题：{query}
-
-请判断问题属于哪一类：
-- "chitchat": 闲聊、打招呼、问候、感谢、告别等非知识性问题
-  示例："你好"、"谢谢"、"再见"、"早上好"、"你是谁"、"怎么样"
-- "clear": 知识性问题，表述明确，语义清晰，可以直接检索
-  示例："Python中list和tuple的区别是什么？"、"什么是面向对象编程？"
-- "vague": 知识性问题，但表述模糊或不完整，需要扩展语义才能有效检索
-  示例："那个怎么用？"、"关于机器学习的东西"、"老师讲的那个方法"
-- "broad": 知识性问题，但过于宽泛，涵盖多个方面，需要拆分为子问题分别检索
-  示例："介绍一下深度学习"、"如何学好编程？"、"Web开发都需要学什么？"
-
-返回格式：{{"type": "chitchat/clear/vague/broad", "sub_questions": ["子问题1", "子问题2"]}}
-
-注意：
-- type为chitchat/clear/vague时，sub_questions为空数组
-- type为broad时，sub_questions包含3-5个具体子问题
-- 只返回JSON，不要其他内容"""
 
 
 HYPOTHETICAL_DOC_PROMPT = """请针对以下问题，生成一段假设性的文档内容，该文档如果存在，将能完美回答这个问题：
@@ -79,23 +59,14 @@ class QAAgent(BaseAgent):
     async def _understand_query(self, state: AgentState) -> AgentState:
         query = state["query"]
         try:
-            result = await LLM.chat(
-                messages=[
-                    {"role": "system", "content": "你是一个问题分析器，只输出JSON。"},
-                    {"role": "user", "content": QUERY_UNDERSTAND_PROMPT.format(query=query)},
-                ],
-                temperature=0.0,
-            )
-            json_match = re.search(r'\{[^{}]*\}', result.strip(), re.DOTALL)
-            if not json_match:
-                raise ValueError(f"未找到有效JSON: {result}")
-            analysis = json.loads(json_match.group())
-            query_type = analysis.get("type", "clear")
+            query_type, score = classify_query_type(query)
+            logger.info(f"问题类型分类: {query_type}, 置信度: {score:.3f}")
+            
             if query_type not in ("chitchat", "clear", "vague", "broad"):
                 logger.warning(f"未知问题类型 '{query_type}'，回退为clear")
                 query_type = "clear"
             state["context"]["query_type"] = query_type
-            state["context"]["sub_questions"] = analysis.get("sub_questions", [])
+            state["context"]["sub_questions"] = []
         except Exception as e:
             logger.warning(f"问题理解失败: {e}，回退为clear")
             state["context"]["query_type"] = "clear"
@@ -116,6 +87,7 @@ class QAAgent(BaseAgent):
                     temperature=0.3,
                 )
                 state["context"]["hyde_query"] = hypo_doc.strip()
+                logger.info(f"HyDE生成成功: {hypo_doc[:50]}...")
             except Exception as e:
                 logger.warning(f"HyDE生成失败: {e}，使用原始query")
                 state["context"]["hyde_query"] = query
@@ -136,6 +108,7 @@ class QAAgent(BaseAgent):
                         sub_questions = json.loads(json_match.group())
                     if isinstance(sub_questions, list) and sub_questions:
                         state["context"]["sub_questions"] = sub_questions
+                        logger.info(f"子问题拆分成功: {sub_questions}")
                     else:
                         state["context"]["sub_questions"] = [query]
                 except Exception as e:
@@ -162,16 +135,26 @@ class QAAgent(BaseAgent):
             await bm25.ensure_index(collection)
 
             if query_type == "broad" and state["context"].get("sub_questions"):
-                for sq in state["context"]["sub_questions"]:
+                sub_questions = state["context"]["sub_questions"]
+                logger.info(f"并行检索 {len(sub_questions)} 个子问题")
+                
+                async def search_sub_question(sq: str):
                     sq_bm25_results = bm25.search(collection, sq, top_k=10) if bm25.has_index(collection) else None
-                    results = await milvus_hybrid_search(
+                    return await milvus_hybrid_search(
                         collection, sq, top_k=10, bm25_results=sq_bm25_results
                     )
+                
+                results_list = await asyncio.gather(*[search_sub_question(sq) for sq in sub_questions])
+                for results in results_list:
                     all_results.extend(results)
+                    
             elif query_type == "vague" and state["context"].get("hyde_query"):
                 hyde_query = state["context"]["hyde_query"]
-                results = await milvus_search(collection, hyde_query, top_k=20)
-                all_results.extend(results)
+                logger.info(f"使用HyDE查询: {hyde_query[:50]}...")
+                
+                hyde_results = await milvus_search(collection, hyde_query, top_k=20)
+                all_results.extend(hyde_results)
+                
                 original_bm25_results = bm25.search(collection, state["query"], top_k=20) if bm25.has_index(collection) else None
                 original_results = await milvus_hybrid_search(
                     collection, state["query"], top_k=10, bm25_results=original_bm25_results
@@ -192,6 +175,7 @@ class QAAgent(BaseAgent):
                 seen.add(key)
                 unique_results.append(r)
 
+        logger.info(f"检索完成，共 {len(unique_results)} 个唯一结果")
         state["context"]["retrieved_docs"] = unique_results
         return state
 
@@ -211,9 +195,11 @@ class QAAgent(BaseAgent):
             state["context"]["reranked_docs"] = relevant_docs
             max_score = max(d["rerank_score"] for d in relevant_docs)
             state["context"]["confidence"] = min(max_score, 1.0)
+            logger.info(f"重排序完成，{len(relevant_docs)} 个相关文档，最高分: {max_score:.3f}")
         else:
             state["context"]["reranked_docs"] = []
             state["context"]["confidence"] = 0.0
+            logger.info("重排序完成，无相关文档")
 
         return state
 

@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     DASHSCOPE_API_KEY: str = ""
     LLM_MODEL_NAME: str = "qwen-max"
     EMBEDDING_MODEL_NAME: str = "text-embedding-v1"
-    INTENT_MODEL_PATH: str = "./models/intent_classifier"
+    INTENT_CLASSIFIER_MODEL: str = "all-MiniLM-L6-v2"
     RERANKER_MODEL_NAME: str = "BAAI/bge-reranker-v2-m3"
     HF_MIRROR_URL: str = "https://hf-mirror.com"
     ENABLE_RERANKER: bool = False

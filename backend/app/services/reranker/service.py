@@ -19,6 +19,10 @@ def _normalize_scores(scores):
     return [float(scores)]
 
 
+def _sigmoid(x):
+    return 1 / (1 + np.exp(-x))
+
+
 def get_reranker():
     global _reranker, _reranker_available
     
@@ -31,10 +35,13 @@ def get_reranker():
     
     if _reranker is None:
         try:
-            from FlagEmbedding import FlagReranker
-            _reranker = FlagReranker(
+            if settings.HF_MIRROR_URL:
+                os.environ["HF_ENDPOINT"] = settings.HF_MIRROR_URL
+            
+            from sentence_transformers import CrossEncoder
+            _reranker = CrossEncoder(
                 settings.RERANKER_MODEL_NAME,
-                use_fp16=True,
+                max_length=512,
             )
             _reranker_available = True
         except Exception as e:
@@ -54,8 +61,10 @@ def rerank(query: str, documents: list[str], top_k: int = 3) -> list[dict]:
         return _fallback_rerank(query, documents, top_k)
     
     pairs = [[query, doc] for doc in documents]
-    scores = reranker.compute_score(pairs, normalize=True)
+    scores = reranker.predict(pairs)
     scores = _normalize_scores(scores)
+    scores = [_sigmoid(s) for s in scores]
+    
     scored_docs = list(zip(documents, scores))
     scored_docs.sort(key=lambda x: x[1], reverse=True)
     results = []
@@ -83,8 +92,10 @@ def rerank_with_metadata(
     
     contents = [doc[content_key] for doc in documents]
     pairs = [[query, content] for content in contents]
-    scores = reranker.compute_score(pairs, normalize=True)
+    scores = reranker.predict(pairs)
     scores = _normalize_scores(scores)
+    scores = [_sigmoid(s) for s in scores]
+    
     for i, score in enumerate(scores):
         documents[i]["rerank_score"] = float(score)
     documents.sort(key=lambda x: x["rerank_score"], reverse=True)
