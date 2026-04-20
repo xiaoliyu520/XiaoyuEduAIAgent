@@ -121,7 +121,7 @@ function scrollToBottom() {
 async function startInterview() {
   loading.value = true
   try {
-    const res = await api.post('/agents/interview/start', form.value)
+    const res = await api.post('/interview/start', form.value)
     conversationId.value = res.data?.conversation_id
     currentStage.value = res.data?.stage
     messages.value.push({ role: 'assistant', content: res.data?.message })
@@ -144,7 +144,7 @@ async function sendResponse() {
   scrollToBottom()
 
   try {
-    const res = await api.post('/agents/interview/respond', {
+    const res = await api.post('/interview/respond', {
       conversation_id: conversationId.value,
       message: text,
     })

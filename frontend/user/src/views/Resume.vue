@@ -83,10 +83,10 @@ async function startReview() {
   try {
     const formData = new FormData()
     formData.append('file', selectedFile.value)
-    const uploadRes = await api.post('/agents/resume/upload', formData)
+    const uploadRes = await api.post('/resume/upload', formData)
     const resumeId = uploadRes.data?.resume_id
 
-    const reviewRes = await api.post('/agents/resume/review', { resume_id: resumeId })
+    const reviewRes = await api.post('/resume/review', { resume_id: resumeId })
     report.value = reviewRes.data
 
     try {
