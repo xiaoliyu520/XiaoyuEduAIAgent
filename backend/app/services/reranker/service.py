@@ -25,6 +25,12 @@ def _sigmoid(x):
     return 1 / (1 + np.exp(-x))
 
 
+def _format_scores(score_list, key=None):
+    if key:
+        return [f"{d[key]:.3f}" for d in score_list]
+    return [f"{s:.3f}" for s in score_list]
+
+
 def get_reranker():
     global _reranker, _reranker_available
     
@@ -86,7 +92,8 @@ def rerank(query: str, documents: list[str], top_k: int = 3) -> list[dict]:
             "score": float(score),
         })
     
-    logger.info(f"重排序完成(CrossEncoder): top_k={len(results)}, scores={[f'{r['score']:.3f}' for r in results]}")
+    score_strs = _format_scores([r["score"] for r in results])
+    logger.info(f"重排序完成(CrossEncoder): top_k={len(results)}, scores={score_strs}")
     return results
 
 
@@ -119,10 +126,8 @@ def rerank_with_metadata(
     documents.sort(key=lambda x: x["rerank_score"], reverse=True)
     
     result = documents[:top_k]
-    logger.info(
-        f"重排序完成(CrossEncoder): top_k={len(result)}, "
-        f"scores={[f'{d['rerank_score']:.3f}' for d in result]}"
-    )
+    score_strs = _format_scores(result, key="rerank_score")
+    logger.info(f"重排序完成(CrossEncoder): top_k={len(result)}, scores={score_strs}")
     return result
 
 
@@ -147,7 +152,8 @@ def _fallback_rerank(query: str, documents: list[str], top_k: int = 3) -> list[d
             "score": normalized_score,
         })
     
-    logger.info(f"重排序完成(BM25降级): top_k={len(results)}, scores={[f'{r['score']:.3f}' for r in results]}")
+    score_strs = _format_scores([r["score"] for r in results])
+    logger.info(f"重排序完成(BM25降级): top_k={len(results)}, scores={score_strs}")
     return results
 
 
@@ -173,8 +179,6 @@ def _fallback_rerank_with_metadata(
     documents.sort(key=lambda x: x["rerank_score"], reverse=True)
     result = documents[:top_k]
     
-    logger.info(
-        f"重排序完成(BM25降级): top_k={len(result)}, "
-        f"scores={[f'{d['rerank_score']:.3f}' for d in result]}"
-    )
+    score_strs = _format_scores(result, key="rerank_score")
+    logger.info(f"重排序完成(BM25降级): top_k={len(result)}, scores={score_strs}")
     return result
