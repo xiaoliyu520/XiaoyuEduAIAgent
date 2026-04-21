@@ -33,13 +33,13 @@
         </el-card>
       </el-col>
       <el-col :span="12">
-        <el-card v-if="result">
+        <el-card v-if="result" class="result-card">
           <template #header>
             <span>检查结果</span>
           </template>
           <div class="result-content" v-html="renderMarkdown(result)"></div>
         </el-card>
-        <el-card v-else>
+        <el-card v-else class="empty-card">
           <el-empty description="输入代码并点击检查" />
         </el-card>
       </el-col>
@@ -267,6 +267,15 @@ onMounted(() => {
 .code-container {
   max-width: 1200px;
   margin: 0 auto;
+}
+.result-card {
+  min-height: calc(100vh - 180px);
+}
+.empty-card {
+  min-height: calc(100vh - 180px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 .result-content {
   line-height: 1.8;
