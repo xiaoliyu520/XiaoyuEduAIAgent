@@ -656,10 +656,9 @@ pytest --cov=app backend/tests/
 
 ### 已实现的优化
 
-#### 1. 三级缓存机制
+#### 1. 缓存机制
 
 - **会话缓存**：缓存对话历史，减少数据库查询
-- **热门问答缓存**：缓存高频问题的答案
 - **摘要缓存**：缓存对话摘要，避免重复计算
 
 #### 2. 流式响应
@@ -915,7 +914,7 @@ curl http://localhost:2358/status
 
 ## 📞 联系方式
 
-- 项目主页：\[https\://github.com/XiaoYu356]
+- 项目主页：\[<https://github.com/XiaoYu356>]
 - 问题反馈：\[GitHub Issues]
 - 邮箱：[3442453092@qq.com](mailto:support@xiaoyu-edu.com)
 

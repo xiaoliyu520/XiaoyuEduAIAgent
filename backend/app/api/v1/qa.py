@@ -284,3 +284,96 @@ async def qa_chat_stream(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@router.get("/conversations", response_model=ResponseBase)
+async def list_conversations(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Conversation)
+        .where(Conversation.user_id == current_user.id)
+        .order_by(Conversation.updated_at.desc())
+    )
+    conversations = result.scalars().all()
+    items = []
+    redis = await get_redis()
+    session_cache = SessionCache(redis)
+    for conv in conversations:
+        msg_result = await db.execute(
+            select(Message)
+            .where(Message.conversation_id == conv.id)
+            .order_by(Message.created_at)
+        )
+        messages = msg_result.scalars().all()
+        msg_list = [
+            {
+                "role": m.role,
+                "content": m.content,
+                "agent_type": m.agent_type,
+                "created_at": m.created_at.isoformat(),
+            }
+            for m in messages
+        ]
+        items.append({
+            "id": conv.id,
+            "agent_type": conv.agent_type,
+            "title": conv.title,
+            "created_at": conv.created_at.isoformat(),
+            "messages": msg_list,
+        })
+        await session_cache.set_messages(conv.id, msg_list)
+    return ResponseBase(data=items)
+
+
+@router.post("/conversations", response_model=ResponseBase)
+async def create_conversation(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    conversation = Conversation(
+        user_id=current_user.id,
+        agent_type="qa",
+        title="新对话",
+    )
+    db.add(conversation)
+    await db.commit()
+    await db.refresh(conversation)
+    return ResponseBase(data={
+        "id": conversation.id,
+        "agent_type": conversation.agent_type,
+        "title": conversation.title,
+        "created_at": conversation.created_at.isoformat(),
+        "messages": [],
+    })
+
+
+@router.delete("/conversations/{conversation_id}", response_model=ResponseBase)
+async def delete_conversation(
+    conversation_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Conversation).where(
+            Conversation.id == conversation_id,
+            Conversation.user_id == current_user.id,
+        )
+    )
+    conversation = result.scalar_one_or_none()
+    if not conversation:
+        raise ValueError("对话不存在")
+    msg_result = await db.execute(
+        select(Message).where(Message.conversation_id == conversation_id)
+    )
+    for msg in msg_result.scalars().all():
+        await db.delete(msg)
+    await db.delete(conversation)
+    await db.commit()
+
+    redis = await get_redis()
+    session_cache = SessionCache(redis)
+    await session_cache.clear(conversation_id)
+
+    return ResponseBase(message="对话已删除")

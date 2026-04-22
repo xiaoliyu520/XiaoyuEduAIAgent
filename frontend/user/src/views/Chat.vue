@@ -149,7 +149,7 @@ function formatTime(time) {
 
 async function loadConversations() {
   try {
-    const res = await api.get('/chat/conversations')
+    const res = await api.get('/qa/conversations')
     conversations.value = res.data || []
   } catch {
     // ignore
@@ -158,7 +158,7 @@ async function loadConversations() {
 
 async function newConversation() {
   try {
-    const res = await api.post('/chat/conversations')
+    const res = await api.post('/qa/conversations')
     conversations.value.unshift(res.data)
     conversationId.value = res.data.id
     messages.value = []
@@ -177,7 +177,7 @@ function selectConversation(conv) {
 
 async function deleteConversation(id) {
   try {
-    await api.delete(`/chat/conversations/${id}`)
+    await api.delete(`/qa/conversations/${id}`)
     conversations.value = conversations.value.filter(c => c.id !== id)
     if (conversationId.value === id) {
       if (conversations.value.length > 0) {
