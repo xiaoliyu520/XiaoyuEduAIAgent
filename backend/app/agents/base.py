@@ -62,16 +62,9 @@ class BaseAgent(ABC):
         history = state.get("messages", [])
         
         if len(history) > self.summary_threshold:
-            summary_messages = history[:-self.max_context_messages]
             recent_messages = history[-self.max_context_messages:]
             
             summary = state.get("context", {}).get("conversation_summary", "")
-            if not summary:
-                import asyncio
-                summary = asyncio.get_event_loop().run_until_complete(
-                    self.summarize_messages(summary_messages)
-                )
-            
             if summary:
                 messages.append({
                     "role": "system",
